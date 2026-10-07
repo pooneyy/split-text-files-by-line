@@ -1,0 +1,119 @@
+name: CI/CD
+
+on:
+  push:
+    tags: "*"
+
+env:
+  GIST_ID: 57876f1651b7ad5cc0912d48766696a8
+  PRODUCT_FILENAME: SplitTextFiles.exe
+
+jobs:
+  change-log:
+    name: Generate change log
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: actions/setup-python@main
+        with:
+          python-version: 3.x
+
+      - name: Get diff file
+        run: |
+          tags=($(git for-each-ref --sort=-creatordate --format='%(refname:short)' refs/tags | head -2))
+          git diff ${tags[1]} ${tags[0]} > diff.txt
+
+      - name: Fetch llm-release-notes-prompt
+        run: |
+          gist_raw=$(curl -s https://api.github.com/gists/${{ env.GIST_ID }})
+          echo "$gist_raw" | jq -r '.files | to_entries[] | "\(.value.raw_url) \(.key)"' |
+          while read -r raw_url filename; do
+              wget --inet4-only -q -c -O "./$filename" "$raw_url"
+          done
+
+      - name: Generate change log
+        run: |
+          pip install llm-release-notes
+          llm-release-notes --baseurl="${{ vars.LLM_API }}" \
+            --apikey="${{ secrets.LLM_API_KEY }}" \
+            --model="${{ vars.LLM_MODEL }}" \
+            --language="zh-CN" \
+            --promptfile="prompt.txt" \
+            --diffile="diff.txt" \
+            --output="changelog.md"
+
+      - name: Upload change log
+        uses: actions/upload-artifact@v7
+        with:
+          name: change-log
+          path: |
+            changelog.md
+            diff.txt
+
+  build:
+    name: Build
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - uses: actions/setup-python@main
+        with:
+          python-version: 3.x
+
+      - name: Install dependencies
+        run: |
+          py -m pip install --upgrade -r requirements.txt
+          py -m pip install --upgrade pyinstaller
+
+      - name: Build executable
+        run: py -m PyInstaller --noconfirm --clean --windowed --onefile --name ${{ env.PRODUCT_FILENAME }} main.py
+
+      - name: Upload built
+        uses: actions/upload-artifact@v7
+        with:
+          name: built
+          path: ./dist/${{ env.PRODUCT_FILENAME }}
+
+  publish-release:
+    name: Publish release
+    needs: 
+      - build
+      - change-log
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: built
+
+      - name: Download docker-configs
+        uses: actions/download-artifact@v7
+        with:
+          name: change-log
+
+      - name: Publish release
+        id: release
+        uses: ncipollo/release-action@v1
+        with:
+          allowUpdates: true
+          artifacts: ${{ env.PRODUCT_FILENAME }}
+          bodyFile: changelog.md
+          draft: true
+          generateReleaseNotes: true
+
+      - name: Add a summary for the job
+        run: |
+          echo "## Release Report" >> $GITHUB_STEP_SUMMARY
+          publish_hash=$(sha256sum -z ${{ env.PRODUCT_FILENAME }} | awk '{print $1}')
+          echo "[${{ env.PRODUCT_FILENAME }}]( $(echo '${{ steps.release.outputs.assets }}' | jq -r '.["${{ env.PRODUCT_FILENAME }}"]') ) <code>sha256:$publish_hash</code>" >> $GITHUB_STEP_SUMMARY
